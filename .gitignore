@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+node_modules/
+*.log
+.env
+.venv
+venv/
+.DS_Store
