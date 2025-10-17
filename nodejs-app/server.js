@@ -32,7 +32,8 @@ app.get('/health', async (req, res) => {
 
   // Test database
   try {
-    await pool.query('SELECT NOW()');
+    const client = await pool.connect();
+    await client.query('SELECT NOW()');
     health.database = 'connected';
   } catch (error) {
     health.database = `error: ${error.message}`;
