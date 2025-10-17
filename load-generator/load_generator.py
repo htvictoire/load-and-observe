@@ -84,7 +84,18 @@ class LoadGenerator:
             
             return True
             
+        except requests.exceptions.Timeout:
+            with self.lock:
+                self.stats['total_requests'] += 1
+                self.stats['failed'] += 1
+                self.stats['timeouts'] += 1
+            logging.error(f"TIMEOUT: {url}")
+            return False
+            
         except Exception as e:
+            with self.lock:
+                self.stats['total_requests'] += 1
+                self.stats['failed'] += 1
             logging.error(f"ERROR: {url} - {str(e)}")
             return False
     

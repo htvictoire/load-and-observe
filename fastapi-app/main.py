@@ -21,6 +21,7 @@ async def health():
     # Test database connection
     try:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        conn.close()
         health_status["database"] = "connected"
     except Exception as e:
         health_status["database"] = f"error: {str(e)}"
