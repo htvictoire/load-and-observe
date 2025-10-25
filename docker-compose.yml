@@ -1,37 +1,58 @@
-version: '3.8'
-
 services:
   # Nginx Reverse Proxy
   nginx:
     image: nginx:alpine
     container_name: nginx-proxy
     ports:
-      - "80:80"
+      - "85:80"
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
-      - fastapi-app
-      - nodejs-app
-      - grafana
+      fastapi-app:
+        condition: service_healthy
+      nodejs-app:
+        condition: service_healthy
+      grafana:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
     networks:
       - frontend
       - backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Python FastAPI Application
   fastapi-app:
-    image: tiangolo/uvicorn-gunicorn-fastapi:python3.11
+    build: ./fastapi-app
     container_name: fastapi-backend
+    command: web
     environment:
       - DATABASE_URL=postgresql://testuser:testpass@postgres:5432/testdb
       - REDIS_URL=redis://redis:6379
     volumes:
       - ./fastapi-app:/app
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
     networks:
       - backend
@@ -40,22 +61,34 @@ services:
         limits:
           cpus: '0.5'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Node.js Express Application
   nodejs-app:
-    image: node:20-alpine
+    build: ./nodejs-app
     container_name: nodejs-backend
-    working_dir: /app
-    command: sh -c "npm install && npm start"
     environment:
       - DATABASE_URL=postgresql://testuser:testpass@postgres:5432/testdb
       - REDIS_URL=redis://redis:6379
       - NODE_ENV=production
     volumes:
       - ./nodejs-app:/app
+      - /app/node_modules
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     networks:
       - backend
@@ -64,6 +97,11 @@ services:
         limits:
           cpus: '0.5'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # PostgreSQL Database
   postgres:
@@ -75,6 +113,12 @@ services:
       - POSTGRES_DB=testdb
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
     networks:
       - backend
@@ -83,6 +127,11 @@ services:
         limits:
           cpus: '0.7'
           memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Redis Cache
   redis:
@@ -91,6 +140,12 @@ services:
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped
     networks:
       - backend
@@ -99,20 +154,33 @@ services:
         limits:
           cpus: '0.3'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Celery Worker (Background Tasks)
   celery-worker:
-    image: tiangolo/uvicorn-gunicorn-fastapi:python3.11
+    build: ./fastapi-app
     container_name: celery-worker
-    command: celery -A tasks worker --loglevel=info
+    command: ["worker"]
     environment:
       - DATABASE_URL=postgresql://testuser:testpass@postgres:5432/testdb
       - REDIS_URL=redis://redis:6379
     volumes:
       - ./fastapi-app:/app
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks inspect ping -d celery@$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - backend
@@ -121,6 +189,118 @@ services:
         limits:
           cpus: '0.5'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # InfluxDB Time-Series Database
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword
+      - DOCKER_INFLUXDB_INIT_ORG=test-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=load_test
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=test-token-please-change
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8086/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # Docker Socket Proxy (Secure Docker API access)
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: docker-socket-proxy
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - NETWORKS=1
+      - INFO=1
+      - VERSION=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:2375/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Telegraf Agent
+  telegraf:
+    image: telegraf:1.28-alpine
+    container_name: telegraf
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /sys:/rootfs/sys:ro
+      - /proc:/rootfs/proc:ro
+      - /etc:/rootfs/etc:ro
+    environment:
+      - HOST_PROC=/rootfs/proc
+      - HOST_SYS=/rootfs/sys
+      - HOST_ETC=/rootfs/etc
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "telegraf", "--test", "--config", "/etc/telegraf/telegraf.conf"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Prometheus
   prometheus:
@@ -130,9 +310,17 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=7d'
+      - '--web.route-prefix=/prometheus'
+      - '--web.external-url=http://localhost:85/prometheus/'
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/prometheus/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
     networks:
       - backend
@@ -141,18 +329,38 @@ services:
         limits:
           cpus: '0.4'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Grafana (Visualization)
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
+    ports:
+      - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=
+      - GF_SERVER_ROOT_URL=http://localhost:85/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     networks:
       - backend
@@ -162,6 +370,11 @@ services:
         limits:
           cpus: '0.3'
           memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Node Exporter (System Metrics)
   node-exporter:
@@ -169,8 +382,15 @@ services:
     container_name: node-exporter
     command:
       - '--path.rootfs=/host'
+      - '--web.listen-address=:9100'
     volumes:
       - /:/host:ro,rslave
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O /dev/null http://127.0.0.1:9100/metrics || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     networks:
       - backend
@@ -179,39 +399,35 @@ services:
         limits:
           cpus: '0.2'
           memory: 128M
-
-  # cAdvisor (Container Metrics)
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    container_name: cadvisor
-    privileged: true
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-      - /dev/disk/:/dev/disk:ro
-    restart: unless-stopped
-    networks:
-      - backend
-    deploy:
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
   # Real Traffic Load Generator
   load-generator:
     image: python:3.11-slim
     container_name: load-generator
     working_dir: /app
-    command: sh -c "pip install requests && python load_generator.py"
+    command: sh -c "pip install requests influxdb-client && python load_generator.py"
     volumes:
       - ./load-generator:/app
     depends_on:
-      - fastapi-app
-      - nodejs-app
-      - nginx
+      nginx:
+        condition: service_healthy
+      fastapi-app:
+        condition: service_healthy
+      nodejs-app:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f load_generator.py || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
     networks:
       - backend
@@ -221,6 +437,11 @@ services:
         limits:
           cpus: '0.5'
           memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
 
 networks:
   frontend:
@@ -231,5 +452,7 @@ networks:
 volumes:
   postgres-data:
   redis-data:
+  influxdb-data:
+  influxdb-config:
   prometheus-data:
   grafana-data:

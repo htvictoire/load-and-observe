@@ -5,6 +5,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import queue
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +25,6 @@ class LoadGenerator:
             'http://nodejs-backend:3000/stress',
         ]
         
-        # Weighted probability - hit stress endpoints more
         self.endpoint_weights = [10, 15, 20, 30, 15, 20, 30]
         
         self.stats = {
@@ -39,6 +40,39 @@ class LoadGenerator:
         }
         self.lock = threading.Lock()
         self.response_times = queue.Queue(maxsize=1000)
+        
+        # Initialize InfluxDB client
+        try:
+            self.influx_client = InfluxDBClient(
+                url="http://influxdb:8086",
+                token="test-token-please-change",
+                org="test-org"
+            )
+            self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
+            logging.info("InfluxDB client initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize InfluxDB client: {e}")
+            self.influx_client = None
+            self.write_api = None
+    
+    def write_to_influxdb(self, measurement, fields, tags=None):
+        """Write metrics to InfluxDB"""
+        if not self.write_api:
+            return
+        
+        try:
+            point = Point(measurement)
+            
+            if tags:
+                for key, value in tags.items():
+                    point = point.tag(key, value)
+            
+            for key, value in fields.items():
+                point = point.field(key, value)
+            
+            self.write_api.write(bucket="load_test", record=point)
+        except Exception as e:
+            logging.error(f"Failed to write to InfluxDB: {e}")
     
     def make_request(self, url):
         """Make a single request and track stats"""
@@ -56,8 +90,10 @@ class LoadGenerator:
                 
                 if response.status_code == 200:
                     self.stats['successful'] += 1
+                    success = True
                 else:
                     self.stats['failed'] += 1
+                    success = False
                 
                 # Update response time stats
                 self.stats['max_response_time'] = max(self.stats['max_response_time'], response_time)
@@ -77,6 +113,20 @@ class LoadGenerator:
                 self.response_times.get()
                 self.response_times.put(response_time)
             
+            # Write individual request to InfluxDB
+            self.write_to_influxdb(
+                measurement="http_request",
+                fields={
+                    "response_time": response_time,
+                    "status_code": code,
+                    "success": 1 if success else 0
+                },
+                tags={
+                    "endpoint": url,
+                    "method": "GET"
+                }
+            )
+            
             if response_time > 2.0:
                 logging.warning(f"SLOW: {url} - {response.status_code} - {response_time:.2f}s")
             else:
@@ -89,6 +139,21 @@ class LoadGenerator:
                 self.stats['total_requests'] += 1
                 self.stats['failed'] += 1
                 self.stats['timeouts'] += 1
+            
+            self.write_to_influxdb(
+                measurement="http_request",
+                fields={
+                    "response_time": 5.0,
+                    "status_code": 0,
+                    "success": 0
+                },
+                tags={
+                    "endpoint": url,
+                    "method": "GET",
+                    "error": "timeout"
+                }
+            )
+            
             logging.error(f"TIMEOUT: {url}")
             return False
             
@@ -96,11 +161,26 @@ class LoadGenerator:
             with self.lock:
                 self.stats['total_requests'] += 1
                 self.stats['failed'] += 1
+            
+            self.write_to_influxdb(
+                measurement="http_request",
+                fields={
+                    "response_time": 0.0,
+                    "status_code": 0,
+                    "success": 0
+                },
+                tags={
+                    "endpoint": url,
+                    "method": "GET",
+                    "error": str(type(e).__name__)
+                }
+            )
+            
             logging.error(f"ERROR: {url} - {str(e)}")
             return False
     
     def load(self, requests_per_second=100, duration_seconds=None):
-        """Generate aggressive load with high concurrency"""
+        """Generate load with high concurrency"""
         delay = 1.0 / requests_per_second
         max_workers = min(requests_per_second * 2, 200)  # 2x parallelism
         
@@ -149,8 +229,7 @@ class LoadGenerator:
     def print_stats(self):
         """Print detailed statistics periodically"""
         while True:
-            time.sleep(10)  # Print every 10 seconds during heavy load
-            
+            time.sleep(10)  # Print every 10 seconds
             with self.lock:
                 runtime = time.time() - self.stats['start_time']
                 actual_rps = self.stats['total_requests'] / runtime if runtime > 0 else 0
@@ -159,9 +238,31 @@ class LoadGenerator:
                 # Get percentiles
                 times_list = list(self.response_times.queue)
                 times_list.sort()
-                p50 = times_list[len(times_list)//2] if times_list else 0
-                p95 = times_list[int(len(times_list)*0.95)] if len(times_list) > 20 else 0
-                p99 = times_list[int(len(times_list)*0.99)] if len(times_list) > 100 else 0
+                p50 = float(times_list[len(times_list)//2]) if times_list else 0.0
+                p95 = float(times_list[int(len(times_list)*0.95)]) if len(times_list) > 20 else 0.0
+                p99 = float(times_list[int(len(times_list)*0.99)]) if len(times_list) > 100 else 0.0
+                
+                # Write aggregated metrics to InfluxDB
+                # Handle min_response_time edge case (infinity if no requests)
+                min_time = self.stats['min_response_time'] if self.stats['min_response_time'] != float('inf') else 0.0
+
+                self.write_to_influxdb(
+                    measurement="load_test_metrics",
+                    fields={
+                        "total_requests": self.stats['total_requests'],
+                        "successful": self.stats['successful'],
+                        "failed": self.stats['failed'],
+                        "timeouts": self.stats['timeouts'],
+                        "actual_rps": actual_rps,
+                        "success_rate": success_rate,
+                        "avg_response_time": self.stats['avg_response_time'],
+                        "min_response_time": min_time,
+                        "max_response_time": self.stats['max_response_time'],
+                        "p50_response_time": p50,
+                        "p95_response_time": p95,
+                        "p99_response_time": p99
+                    }
+                )
                 
                 logging.info(f"""
 ╔════════════════════════════════════════════════════════╗
@@ -192,34 +293,17 @@ class LoadGenerator:
                 
                 logging.info("╚════════════════════════════════════════════════════════╝")
                 
-                # Warning indicators
                 if success_rate < 95:
-                    logging.warning("WARNING: Success rate below 95%! VPS is struggling!")
+                    logging.warning("WARNING: Success rate below 95%")
                 if actual_rps < (self.stats['total_requests'] / runtime * 0.8):
-                    logging.warning("WARNING: Not keeping up with target RPS!")
+                    logging.warning("WARNING: Not keeping up with target RPS")
                 if self.stats['avg_response_time'] > 2.0:
-                    logging.warning("WARNING: Average response time > 2s!")
+                    logging.warning("WARNING: Average response time exceeds 2 seconds")
 
 if __name__ == '__main__':
     generator = LoadGenerator()
     
-    # Start stats printer in background
     stats_thread = threading.Thread(target=generator.print_stats, daemon=True)
     stats_thread.start()
     
-    # CHOOSE YOUR LOAD LEVEL:
-    
-    # Light test (warm up)
-    # generator.load(requests_per_second=50, duration_seconds=60)
-    
-    # Moderate traffic (100 req/sec) - Should push VPS
-    generator.load(requests_per_second=100, duration_seconds=None)
-    
-    # Heavy traffic (150 req/sec) - Should really struggle
-    # generator.load(requests_per_second=150, duration_seconds=None)
-    
-    # Stress test (200 req/sec) - Likely to fail
-    # generator.load(requests_per_second=200, duration_seconds=None)
-    
-    # EXTREME (300+ req/sec) - Will definitely crash
-    # generator.load(requests_per_second=300, duration_seconds=300)
+    generator.load(requests_per_second=1, duration_seconds=None)

@@ -4,7 +4,10 @@ import redis
 import time
 import os
 
-app = FastAPI(title="VPS Test API")
+app = FastAPI(
+    title="VPS Test API",
+    root_path="/api"
+)
 
 @app.get("/")
 async def root():
