@@ -10,7 +10,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(levelname)s - %(message)s'
 )
 
 class LoadGenerator:
@@ -41,7 +41,6 @@ class LoadGenerator:
         self.lock = threading.Lock()
         self.response_times = queue.Queue(maxsize=1000)
         
-        # Initialize InfluxDB client
         try:
             self.influx_client = InfluxDBClient(
                 url="http://influxdb:8086",
@@ -56,7 +55,6 @@ class LoadGenerator:
             self.write_api = None
     
     def write_to_influxdb(self, measurement, fields, tags=None):
-        """Write metrics to InfluxDB"""
         if not self.write_api:
             return
         
@@ -75,7 +73,6 @@ class LoadGenerator:
             logging.error(f"Failed to write to InfluxDB: {e}")
     
     def make_request(self, url):
-        """Make a single request and track stats"""
         try:
             start_time = time.time()
             response = requests.get(url, timeout=5)
@@ -84,7 +81,6 @@ class LoadGenerator:
             with self.lock:
                 self.stats['total_requests'] += 1
                 
-                # Track status codes
                 code = response.status_code
                 self.stats['status_codes'][code] = self.stats['status_codes'].get(code, 0) + 1
                 
@@ -95,25 +91,21 @@ class LoadGenerator:
                     self.stats['failed'] += 1
                     success = False
                 
-                # Update response time stats
                 self.stats['max_response_time'] = max(self.stats['max_response_time'], response_time)
                 self.stats['min_response_time'] = min(self.stats['min_response_time'], response_time)
                 
-                # Calculate rolling average
                 total = self.stats['successful'] + self.stats['failed']
                 current_avg = self.stats['avg_response_time']
                 self.stats['avg_response_time'] = (
                     (current_avg * (total - 1) + response_time) / total
                 )
             
-            # Store for percentile calculation
             try:
                 self.response_times.put_nowait(response_time)
             except queue.Full:
                 self.response_times.get()
                 self.response_times.put(response_time)
             
-            # Write individual request to InfluxDB
             self.write_to_influxdb(
                 measurement="http_request",
                 fields={
@@ -180,20 +172,19 @@ class LoadGenerator:
             return False
     
     def load(self, requests_per_second=100, duration_seconds=None):
-        """Generate load with high concurrency"""
         delay = 1.0 / requests_per_second
-        max_workers = min(requests_per_second * 2, 200)  # 2x parallelism
+        max_workers = min(requests_per_second * 2, 200)
         
-        logging.info(f"""
-╔═══════════════════════════════════════════════════╗
-║                 LOAD TEST STARTED                 ║
-╠═══════════════════════════════════════════════════╣
-║  Target RPS:        {requests_per_second:>6}                       ║
-║  Worker Threads:    {max_workers:>6}                       ║
-║  Duration:          {'Infinite' if not duration_seconds else f'{duration_seconds}s':>10}                ║
-║  Timeout per req:   5s                            ║
-╚═══════════════════════════════════════════════════╝
-        """)
+        duration_display = 'Infinite' if not duration_seconds else f'{duration_seconds}s'
+        
+        logging.info("=" * 68)
+        logging.info("                        LOAD TEST STARTED                        ")
+        logging.info("=" * 68)
+        logging.info(f"  Target RPS         : {requests_per_second:>10}")
+        logging.info(f"  Worker Threads     : {max_workers:>10}")
+        logging.info(f"  Duration           : {duration_display:>10}")
+        logging.info(f"  Timeout per req    : {'5s':>10}")
+        logging.info("=" * 68)
         
         start_time = time.time()
         
@@ -202,48 +193,39 @@ class LoadGenerator:
             request_count = 0
             
             while True:
-                # Check duration
                 if duration_seconds and (time.time() - start_time) > duration_seconds:
                     logging.info("Duration reached, finishing pending requests...")
                     break
                 
-                # Submit request
                 url = random.choices(self.endpoints, weights=self.endpoint_weights)[0]
                 future = executor.submit(self.make_request, url)
                 futures.append(future)
                 request_count += 1
                 
-                # Clean up completed futures periodically
                 if len(futures) > 1000:
                     futures = [f for f in futures if not f.done()]
                 
-                # Rate limiting
                 time.sleep(delay)
             
-            # Wait for remaining requests
             for future in as_completed(futures):
                 future.result()
         
         logging.info("Load test completed!")
     
     def print_stats(self):
-        """Print detailed statistics periodically"""
         while True:
-            time.sleep(10)  # Print every 10 seconds
+            time.sleep(10)
             with self.lock:
                 runtime = time.time() - self.stats['start_time']
                 actual_rps = self.stats['total_requests'] / runtime if runtime > 0 else 0
                 success_rate = (self.stats['successful'] / self.stats['total_requests'] * 100) if self.stats['total_requests'] > 0 else 0
                 
-                # Get percentiles
                 times_list = list(self.response_times.queue)
                 times_list.sort()
                 p50 = float(times_list[len(times_list)//2]) if times_list else 0.0
                 p95 = float(times_list[int(len(times_list)*0.95)]) if len(times_list) > 20 else 0.0
                 p99 = float(times_list[int(len(times_list)*0.99)]) if len(times_list) > 100 else 0.0
                 
-                # Write aggregated metrics to InfluxDB
-                # Handle min_response_time edge case (infinity if no requests)
                 min_time = self.stats['min_response_time'] if self.stats['min_response_time'] != float('inf') else 0.0
 
                 self.write_to_influxdb(
@@ -264,41 +246,55 @@ class LoadGenerator:
                     }
                 )
                 
-                logging.info(f"""
-╔════════════════════════════════════════════════════════╗
-║               REAL-TIME PERFORMANCE STATS              ║
-╠════════════════════════════════════════════════════════╣
-║  Runtime:           {runtime:>8.0f}s                          ║
-║  Total Requests:    {self.stats['total_requests']:>8}                           ║
-║  Successful:        {self.stats['successful']:>8} ({success_rate:>5.1f}%)                ║
-║  Failed:            {self.stats['failed']:>8}                           ║
-║  Timeouts:          {self.stats['timeouts']:>8}                           ║
-╠════════════════════════════════════════════════════════╣
-║  Target RPS:        Configured                         ║
-║  Actual RPS:        {actual_rps:>8.1f}                           ║
-╠════════════════════════════════════════════════════════╣
-║  Response Times:                                       ║
-║    Average:         {self.stats['avg_response_time']:>7.3f}s                         ║
-║    Min:             {self.stats['min_response_time']:>7.3f}s                         ║
-║    Max:             {self.stats['max_response_time']:>7.3f}s                         ║
-║    P50 (median):    {p50:>7.3f}s                         ║
-║    P95:             {p95:>7.3f}s                         ║
-║    P99:             {p99:>7.3f}s                         ║
-╠════════════════════════════════════════════════════════╣
-║  Status Codes:                                         ║
-                """)
+                logging.info("")
+                logging.info("")
+                logging.info("")
+                logging.info("")
+                logging.info("")
+                logging.info("=" * 68)
+                logging.info("                  REAL-TIME PERFORMANCE STATS                  ")
+                logging.info("=" * 68)
+                logging.info(f"  Runtime            : {runtime:>10.0f}s")
+                logging.info(f"  Total Requests     : {self.stats['total_requests']:>10}")
+                logging.info(f"  Successful         : {self.stats['successful']:>10}")
+                logging.info(f"  Success Rate       : {success_rate:>9.1f}%")
+                logging.info(f"  Failed             : {self.stats['failed']:>10}")
+                logging.info(f"  Timeouts           : {self.stats['timeouts']:>10}")
+                logging.info("=" * 68)
+                logging.info(f"  Target RPS         : {'Configured':>10}")
+                logging.info(f"  Actual RPS         : {actual_rps:>10.1f}")
+                logging.info("=" * 68)
+                logging.info("  Response Times")
+                logging.info(f"    Average          : {self.stats['avg_response_time']:>10.3f}s")
+                logging.info(f"    Min              : {min_time:>10.3f}s")
+                logging.info(f"    Max              : {self.stats['max_response_time']:>10.3f}s")
+                logging.info(f"    P50 (median)     : {p50:>10.3f}s")
+                logging.info(f"    P95              : {p95:>10.3f}s")
+                logging.info(f"    P99              : {p99:>10.3f}s")
+                logging.info("=" * 68)
+                logging.info("  Status Codes")
                 
                 for code, count in sorted(self.stats['status_codes'].items()):
-                    logging.info(f"║    {code}: {count:>8}                                    ║")
+                    logging.info(f"    {code}              : {count:>10}")
                 
-                logging.info("╚════════════════════════════════════════════════════════╝")
+                logging.info("=" * 68)
+                logging.info("")
                 
                 if success_rate < 95:
-                    logging.warning("WARNING: Success rate below 95%")
+                    logging.warning("=" * 68)
+                    logging.warning("  WARNING: Success rate below 95%")
+                    logging.warning("=" * 68)
+                    logging.warning("")
                 if actual_rps < (self.stats['total_requests'] / runtime * 0.8):
-                    logging.warning("WARNING: Not keeping up with target RPS")
+                    logging.warning("=" * 68)
+                    logging.warning("  WARNING: Not keeping up with target RPS")
+                    logging.warning("=" * 68)
+                    logging.warning("")
                 if self.stats['avg_response_time'] > 2.0:
-                    logging.warning("WARNING: Average response time exceeds 2 seconds")
+                    logging.warning("=" * 68)
+                    logging.warning("  WARNING: Average response time exceeds 2 seconds")
+                    logging.warning("=" * 68)
+                    logging.warning("")
 
 if __name__ == '__main__':
     generator = LoadGenerator()

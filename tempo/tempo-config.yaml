@@ -1,0 +1,88 @@
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m               # cut the headblock when this much time passes
+  max_block_bytes: 1_000_000           # cut the headblock when it hits this size (bytes)
+  complete_block_timeout: 15m          # timeout for completing a block
+
+compactor:
+  compaction:
+    block_retention: 336h                # retention for trace data (14 days for testing)
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: docker-compose
+  storage:
+    path: /tmp/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/prometheus/api/v1/write
+        send_exemplars: true
+        headers:
+          X-Scope-OrgID: docker-compose
+
+  # Service graph metrics
+  traces_storage:
+    path: /tmp/tempo/generator/traces
+
+  # Metrics generation config
+  processor:
+    service_graphs:
+      dimensions:
+        - service.namespace
+        - http.method
+        - http.status_code
+      histogram_buckets: [0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+    span_metrics:
+      dimensions:
+        - service.namespace
+        - http.method
+        - http.status_code
+        - http.route
+      histogram_buckets: [0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048, 4.096, 8.192, 16.384]
+
+storage:
+  trace:
+    backend: local                     # local storage for testing
+    wal:
+      path: /tmp/tempo/wal             # write-ahead log path
+      v2_encoding: snappy
+    local:
+      path: /tmp/tempo/blocks
+    pool:
+      max_workers: 100                 # workers for storage operations
+      queue_depth: 10000
+
+# Query configuration
+query_frontend:
+  search:
+    max_duration: 0
+
+querier:
+  max_concurrent_queries: 20
+  frontend_worker:
+    frontend_address: localhost:9095
+
+# Override defaults for performance testing
+overrides:
+  metrics_generator_processors: [service-graphs, span-metrics]
+  metrics_generator_collection_interval: 15s
+  max_bytes_per_trace: 50_000_000
+  max_search_duration: 168h
+  ingestion_rate_limit_bytes: 15000000
+  ingestion_burst_size_bytes: 20000000
