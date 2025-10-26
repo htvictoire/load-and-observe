@@ -31,7 +31,7 @@ metrics_generator:
   storage:
     path: /tmp/tempo/generator/wal
     remote_write:
-      - url: http://prometheus:9090/prometheus/api/v1/write
+      - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
         headers:
           X-Scope-OrgID: docker-compose
@@ -76,7 +76,7 @@ query_frontend:
 querier:
   max_concurrent_queries: 20
   frontend_worker:
-    frontend_address: localhost:9095
+    frontend_address: tempo:9095
 
 # Override defaults for performance testing
 overrides:
